@@ -1,0 +1,226 @@
+name: 🚀 Deploy
+
+on:
+  push:
+    branches:
+      - main        # Production deployment
+      - staging     # Staging deployment
+  workflow_dispatch: # Manual deployment trigger
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: 🎯 Determine Environment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.env.outputs.environment }}
+      deploy-url: ${{ steps.env.outputs.deploy-url }}
+
+    steps:
+      - name: 🎯 Determine deployment environment
+        id: env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+            echo "deploy-url=https://chatbot-builder.vercel.app" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/staging" ]]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+            echo "deploy-url=https://chatbot-builder-staging.vercel.app" >> $GITHUB_OUTPUT
+          else
+            echo "environment=preview" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    name: 🏗️ Build Applications
+    runs-on: ubuntu-latest
+    needs: prepare
+
+    steps:
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: 📦 Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: 🏗️ Build web application
+        run: bun run build
+        working-directory: apps/web
+        env:
+          NODE_ENV: production
+          NEXT_PUBLIC_APP_URL: ${{ needs.prepare.outputs.deploy-url }}
+
+      - name: 🎛️ Build embeddable widget
+        run: bun run build:embed
+        working-directory: apps/widget
+        env:
+          NODE_ENV: production
+
+      - name: 📚 Build documentation
+        run: bun run build
+        working-directory: apps/docs
+        env:
+          NODE_ENV: production
+
+      - name: 📤 Upload web build
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-build
+          path: apps/web/.next
+          retention-days: 7
+
+      - name: 📤 Upload widget build
+        uses: actions/upload-artifact@v4
+        with:
+          name: widget-build
+          path: apps/widget/dist
+          retention-days: 7
+
+      - name: 📤 Upload docs build
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-build
+          path: apps/docs/.next
+          retention-days: 7
+
+  deploy-web:
+    name: 🌐 Deploy Web App
+    runs-on: ubuntu-latest
+    needs: [prepare, build]
+    environment: ${{ needs.prepare.outputs.environment }}
+    
+    steps:
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 📥 Download web build
+        uses: actions/download-artifact@v4
+        with:
+          name: web-build
+          path: apps/web/.next
+
+      - name: 🚀 Deploy to Vercel
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          working-directory: apps/web
+          vercel-args: ${{ needs.prepare.outputs.environment == 'production' && '--prod' || '' }}
+
+  deploy-widget:
+    name: 🎛️ Deploy Widget to CDN
+    runs-on: ubuntu-latest
+    needs: [prepare, build]
+    if: needs.prepare.outputs.environment == 'production'
+
+    steps:
+      - name: 📥 Download widget build
+        uses: actions/download-artifact@v4
+        with:
+          name: widget-build
+          path: widget-dist
+
+      - name: 🌊 Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: 📤 Upload to S3 and invalidate CloudFront
+        run: |
+          # Upload widget files to S3
+          aws s3 sync widget-dist/ s3://${{ secrets.S3_BUCKET_NAME }}/widget/ --delete
+          
+          # Invalidate CloudFront cache
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/widget/*"
+
+  deploy-docs:
+    name: 📚 Deploy Documentation
+    runs-on: ubuntu-latest
+    needs: [prepare, build]
+
+    steps:
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 📥 Download docs build
+        uses: actions/download-artifact@v4
+        with:
+          name: docs-build
+          path: apps/docs/.next
+
+      - name: 🚀 Deploy docs to Vercel
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_DOCS_PROJECT_ID }}
+          working-directory: apps/docs
+          vercel-args: ${{ needs.prepare.outputs.environment == 'production' && '--prod' || '' }}
+
+  notify-deployment:
+    name: 📢 Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [prepare, deploy-web, deploy-widget, deploy-docs]
+    if: always()
+
+    steps:
+      - name: ✅ Deployment successful
+        if: needs.deploy-web.result == 'success'
+        run: |
+          echo "🚀 Deployment to ${{ needs.prepare.outputs.environment }} completed successfully!"
+          echo "🌐 Web App: ${{ needs.prepare.outputs.deploy-url }}"
+          echo "📚 Docs: Available"
+          if [[ "${{ needs.prepare.outputs.environment }}" == "production" ]]; then
+            echo "🎛️ Widget CDN: Updated"
+          fi
+
+      - name: ❌ Deployment failed
+        if: needs.deploy-web.result == 'failure' || needs.deploy-widget.result == 'failure' || needs.deploy-docs.result == 'failure'
+        run: |
+          echo "❌ Deployment to ${{ needs.prepare.outputs.environment }} failed!"
+          echo "Web App: ${{ needs.deploy-web.result }}"
+          echo "Widget: ${{ needs.deploy-widget.result }}"
+          echo "Docs: ${{ needs.deploy-docs.result }}"
+          exit 1
+
+  post-deployment:
+    name: 🔍 Post-Deployment Checks
+    runs-on: ubuntu-latest
+    needs: [prepare, deploy-web]
+    if: needs.deploy-web.result == 'success'
+
+    steps:
+      - name: 🏥 Health check
+        run: |
+          echo "Performing health check on ${{ needs.prepare.outputs.deploy-url }}"
+          # Add health check logic here
+          # curl -f ${{ needs.prepare.outputs.deploy-url }}/api/health || exit 1
+
+      - name: 🔄 Update database (if needed)
+        if: needs.prepare.outputs.environment == 'production'
+        run: |
+          echo "Database migrations would run here"
+          # Add database migration logic if needed

@@ -1,0 +1,236 @@
+name: 🔒 Security & Quality
+
+on:
+  push:
+    branches: [main, development]
+  pull_request:
+    branches: [main, development]
+  schedule:
+    # Run security scans daily at 6 AM UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch: # Manual trigger
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  codeql-analysis:
+    name: 🔍 CodeQL Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ['javascript']
+
+    steps:
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔍 Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended,security-and-quality
+
+      - name: 🔧 Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: 📦 Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: 🏗️ Build for analysis
+        run: bun run build
+
+      - name: 🔍 Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{matrix.language}}"
+
+  dependency-audit:
+    name: 🔒 Dependency Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: 📦 Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: 🔒 Audit dependencies
+        run: bun audit --exit-code
+
+      - name: 📋 Check for known vulnerabilities
+        run: |
+          echo "🔍 Checking for high-severity vulnerabilities..."
+          bun audit --audit-level high
+
+  secret-scan:
+    name: 🕵️ Secret Scanning
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Full history for secret scanning
+
+      - name: 🕵️ Run TruffleHog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: main
+          head: HEAD
+          extra_args: --debug --only-verified
+
+  license-compliance:
+    name: 📄 License Compliance
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: 📦 Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: 📄 Check license compliance
+        run: |
+          echo "📄 Checking license compliance..."
+          # Install license checker
+          bun add -g license-checker
+          
+          # Check for non-compliant licenses
+          license-checker \
+            --onlyAllow "MIT;Apache-2.0;BSD-2-Clause;BSD-3-Clause;ISC;0BSD;Unlicense" \
+            --excludePrivatePackages \
+            --failOn "GPL;AGPL;LGPL;CDDL;EPL"
+
+  security-scorecard:
+    name: 📊 OSSF Scorecard
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    permissions:
+      security-events: write
+      id-token: write
+      actions: read
+      contents: read
+
+    steps:
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: 📊 Run analysis
+        uses: ossf/scorecard-action@v2.4.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: 📤 Upload SARIF results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+
+  dockerfile-security:
+    name: 🐳 Dockerfile Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: contains(github.event.head_commit.modified, 'Dockerfile') || contains(github.event.head_commit.added, 'Dockerfile')
+
+    steps:
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐳 Scan Dockerfiles with Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: "*/Dockerfile"
+          format: sarif
+          output-file: hadolint-results.sarif
+
+      - name: 📤 Upload SARIF results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: hadolint-results.sarif
+
+  environment-security:
+    name: 🌍 Environment Security Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔍 Check for exposed secrets in env files
+        run: |
+          echo "🔍 Checking for potential secrets in environment files..."
+          
+          # Check for actual values in .env.example (should only have placeholders)
+          if grep -E "sk-[a-zA-Z0-9]{48}" .env.example 2>/dev/null; then
+            echo "❌ Real API keys found in .env.example!"
+            exit 1
+          fi
+          
+          if grep -E "pk_test_[a-zA-Z0-9]+" .env.example 2>/dev/null; then
+            echo "❌ Real Clerk keys found in .env.example!"
+            exit 1
+          fi
+          
+          echo "✅ Environment files appear secure"
+
+  generate-security-report:
+    name: 📋 Generate Security Report
+    runs-on: ubuntu-latest
+    needs: [codeql-analysis, dependency-audit, secret-scan, license-compliance]
+    if: always()
+
+    steps:
+      - name: 📋 Compile security status
+        run: |
+          echo "# 🔒 Security Scan Results" >> security-report.md
+          echo "" >> security-report.md
+          echo "| Check | Status |" >> security-report.md
+          echo "|-------|--------|" >> security-report.md
+          echo "| CodeQL Analysis | ${{ needs.codeql-analysis.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> security-report.md
+          echo "| Dependency Audit | ${{ needs.dependency-audit.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> security-report.md
+          echo "| Secret Scanning | ${{ needs.secret-scan.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> security-report.md
+          echo "| License Compliance | ${{ needs.license-compliance.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> security-report.md
+          echo "" >> security-report.md
+          echo "_Generated on $(date)_" >> security-report.md
+
+      - name: 📤 Upload security report
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report
+          path: security-report.md
+          retention-days: 30
+
+      - name: ❌ Fail if critical security issues found
+        if: needs.codeql-analysis.result == 'failure' || needs.dependency-audit.result == 'failure' || needs.secret-scan.result == 'failure'
+        run: |
+          echo "❌ Critical security issues detected!"
+          echo "Please review the security scan results above."
+          exit 1
